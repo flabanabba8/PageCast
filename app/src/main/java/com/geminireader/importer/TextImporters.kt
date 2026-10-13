@@ -10,6 +10,7 @@ import java.io.ByteArrayInputStream
 import java.io.InputStream
 import java.io.ByteArrayOutputStream
 import java.net.URI
+import java.net.URLDecoder
 import java.util.zip.ZipInputStream
 
 data class Imported(val book: Book, val cover: ByteArray? = null)
@@ -116,9 +117,25 @@ object TextImporters {
     fun epub(bytes: ByteArray): Imported {
         val files = zip(bytes)
         fun xml(path: String) = Jsoup.parse(decode(files[path] ?: error("EPUB is missing $path")), "", Parser.xmlParser())
-        fun resolve(base: String, path: String): String = URI(base).resolve(path.substringBefore('#')).normalize().path.removePrefix("/")
-        fun reference(base: String, href: String): String = resolve(base, href) + if ('#' in href) "#${href.substringAfter('#')}" else ""
-        val opfPath = xml("META-INF/container.xml").local("rootfile").firstOrNull()?.attr("full-path") ?: error("EPUB has no rootfile")
+        val invalidEscape = Regex("%(?![0-9a-fA-F]{2})")
+        fun decodeReference(value: String): String = URLDecoder.decode(
+            value.replace("+", "%2B").replace(invalidEscape, "%25"), "UTF-8")
+        fun resolve(base: String, path: String): String {
+            // EPUB producers sometimes leave spaces and other filename characters unescaped.
+            // Decode hrefs once, then use the path constructor to quote literal filename characters.
+            val target = decodeReference(path.substringBefore('#').substringBefore('?'))
+            val joined = when {
+                target.isEmpty() -> base
+                target.startsWith('/') -> target
+                else -> base.substringBeforeLast('/', "") + "/" + target
+            }
+            val normalized = URI(null, null, "/" + joined.trimStart('/'), null).normalize().path.removePrefix("/")
+            require(normalized != ".." && !normalized.startsWith("../")) { "EPUB reference leaves the archive root" }
+            return normalized
+        }
+        fun reference(base: String, href: String): String = resolve(base, href) + if ('#' in href) "#${decodeReference(href.substringAfter('#'))}" else ""
+        val rootfile = xml("META-INF/container.xml").local("rootfile").firstOrNull()?.attr("full-path") ?: error("EPUB has no rootfile")
+        val opfPath = if (rootfile in files) rootfile else resolve("", rootfile)
         val opf = xml(opfPath)
         val manifest = opf.local("item").associateBy { it.attr("id") }
         val title = opf.local("title").firstOrNull()?.text().orEmpty().ifBlank { "Untitled" }
